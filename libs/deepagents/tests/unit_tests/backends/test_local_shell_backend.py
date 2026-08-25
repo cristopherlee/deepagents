@@ -1,12 +1,16 @@
 """Unit tests for LocalShellBackend."""
 
+import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 import pytest
 
 from deepagents.backends.local_shell import LocalShellBackend
 from deepagents.backends.protocol import ExecuteResponse
+
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="LocalShellBackend requires sh, not available on Windows")
 
 
 def test_local_shell_backend_initialization() -> None:
@@ -304,3 +308,25 @@ async def test_local_shell_backend_async_filesystem_operations() -> None:
         content = await backend.aread("/async_test.txt")
         assert content.file_data is not None
         assert "modified content" in content.file_data["content"]
+
+
+class TestLocalShellVirtualModeDefault:
+    """`virtual_mode` defaults to `True` and never emits a deprecation."""
+
+    def test_omitted_virtual_mode_defaults_true(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            be = LocalShellBackend(root_dir=tmpdir)
+
+        deprecations = [w for w in captured if issubclass(w.category, DeprecationWarning) and "virtual_mode" in str(w.message)]
+        assert deprecations == []
+        assert be.virtual_mode is True
+
+    def test_explicit_virtual_mode_does_not_warn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            LocalShellBackend(root_dir=tmpdir, virtual_mode=False)
+            LocalShellBackend(root_dir=tmpdir, virtual_mode=True)
+
+        deprecations = [w for w in captured if issubclass(w.category, DeprecationWarning) and "virtual_mode" in str(w.message)]
+        assert deprecations == []

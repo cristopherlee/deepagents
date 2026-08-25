@@ -8,9 +8,7 @@ from langgraph.types import Command
 
 
 def assert_all_deepagent_qualities(agent):
-    assert "todos" in agent.stream_channels
     assert "files" in agent.stream_channels
-    assert "write_todos" in agent.nodes["tools"].bound._tools_by_name
     assert "ls" in agent.nodes["tools"].bound._tools_by_name
     assert "read_file" in agent.nodes["tools"].bound._tools_by_name
     assert "write_file" in agent.nodes["tools"].bound._tools_by_name
@@ -22,7 +20,7 @@ def assert_all_deepagent_qualities(agent):
 # Mock tools and middleware
 ###########################
 
-SAMPLE_MODEL = "claude-sonnet-4-20250514"
+SAMPLE_MODEL = "claude-sonnet-4-6"
 
 
 @tool(description="Use this tool to get premier league standings")

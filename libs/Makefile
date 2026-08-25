@@ -1,11 +1,17 @@
 MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-PACKAGE_DIRS := $(sort $(patsubst %/,%,$(dir $(patsubst $(MAKEFILE_DIR)%,%,$(wildcard $(MAKEFILE_DIR)*/Makefile $(MAKEFILE_DIR)partners/*/Makefile)))))
+LIB_PACKAGE_DIRS := $(patsubst %/,%,$(dir $(patsubst $(MAKEFILE_DIR)%,%,$(wildcard $(MAKEFILE_DIR)*/Makefile $(MAKEFILE_DIR)partners/*/Makefile))))
+EXAMPLE_PACKAGE_DIRS := $(patsubst %/,%,$(patsubst $(MAKEFILE_DIR)%,%,$(dir $(wildcard $(MAKEFILE_DIR)../examples/*/pyproject.toml))))
+PACKAGE_DIRS := $(sort $(LIB_PACKAGE_DIRS) $(EXAMPLE_PACKAGE_DIRS))
 
 # Map package dirs to their required Python version
 # acp requires 3.14, everything else uses 3.12
 python_version = $(if $(filter acp,$1),3.14,3.12)
 
-.PHONY: help lock lock-bump lock-check lint format
+.PHONY: help lock no-cache lock-bump lock-check lint format bench-all
+
+LOCK_ARGS := $(if $(filter no-cache,$(MAKECMDGOALS)),--no-cache,)
+
+BENCH_PACKAGES := deepagents code
 
 .DEFAULT_GOAL := help
 
@@ -15,13 +21,16 @@ help: ## Show this help message
 	@echo "Targets:"
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-lock: ## Update all lockfiles
+lock: ## Update all lockfiles (append 'no-cache' to bypass uv's cache)
 	@set -e; \
 	$(foreach pkg,$(PACKAGE_DIRS), \
 		echo "🔒 Locking $(pkg)"; \
-		uv lock --directory '$(pkg)' --python '$(call python_version,$(pkg))'; \
+		uv lock --directory '$(pkg)' --python '$(call python_version,$(pkg))' $(LOCK_ARGS); \
 	)
 	@echo "✅ All lockfiles updated!"
+
+no-cache:
+	@:
 
 lock-bump: ## Bump a dependency across all lockfiles (usage: make lock-bump DEP=requests)
 	@if [ -z "$(DEP)" ]; then \
@@ -45,7 +54,7 @@ lock-check: ## Check all lockfiles are up-to-date
 
 lint: ## Lint all packages
 	@set -e; \
-	for dir in $(PACKAGE_DIRS); do \
+	for dir in $(LIB_PACKAGE_DIRS); do \
 		echo "🔍 Linting $$dir"; \
 		$(MAKE) -C "$$dir" lint; \
 	done
@@ -53,8 +62,15 @@ lint: ## Lint all packages
 
 format: ## Format all packages
 	@set -e; \
-	for dir in $(PACKAGE_DIRS); do \
+	for dir in $(LIB_PACKAGE_DIRS); do \
 		echo "🎨 Formatting $$dir"; \
 		$(MAKE) -C "$$dir" format; \
 	done
 	@echo "✅ All packages formatted!"
+
+bench-all: ## Run benchmarks across all benched packages
+	@set -e; \
+	for pkg in $(BENCH_PACKAGES); do \
+		echo "--> bench: $$pkg"; \
+		$(MAKE) -C $$pkg bench; \
+	done

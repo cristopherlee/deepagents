@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeAlias, TypeGuard
 from uuid import uuid4
 
 from acp import (
     Agent as ACPAgent,
     InitializeResponse,
+    LoadSessionResponse,
     NewSessionResponse,
     PromptResponse,
     SetSessionConfigOptionResponse,
     SetSessionModeResponse,
+    audio_block,
+    image_block,
     run_agent as run_acp_agent,
+    schema as _acp_schema,
     start_edit_tool_call,
     start_tool_call,
     text_block,
@@ -26,6 +30,7 @@ from acp import (
 from acp.exceptions import RequestError
 from acp.schema import (
     AgentCapabilities,
+    AgentMessageChunk,
     AgentPlanUpdate,
     AudioContentBlock,
     ClientCapabilities,
@@ -38,7 +43,7 @@ from acp.schema import (
     PlanEntry,
     PromptCapabilities,
     ResourceContentBlock,
-    SessionConfigOption,
+    SessionConfigOptionBoolean,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
     SessionModeState,
@@ -47,19 +52,13 @@ from acp.schema import (
     ToolCallStart,
     ToolCallUpdate,
     ToolKind,
+    UserMessageChunk,
 )
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, StateSnapshot
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from acp.interfaces import Client
-    from deepagents.graph import Checkpointer
-    from langchain_core.runnables import RunnableConfig
 
 from deepagents_acp.utils import (
     contains_dangerous_patterns,
@@ -72,6 +71,85 @@ from deepagents_acp.utils import (
     format_execute_result,
     truncate_execute_command_for_display,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping, Sequence
+
+    from acp.interfaces import Client
+    from deepagents.graph import Checkpointer
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.types import Interrupt
+
+# agent-client-protocol v0.9.0+ removed the SessionConfigOption wrapper; config
+# options are now bare SessionConfigOptionSelect instances. Resolve dynamically
+# so the module imports cleanly under both v0.8.x and v0.9+.
+SessionConfigOption: Any = getattr(_acp_schema, "SessionConfigOption", None)
+"""Compatibility alias for the optional ACP `SessionConfigOption` wrapper."""
+
+McpServer: TypeAlias = HttpMcpServer | SseMcpServer | McpServerStdio
+"""Type alias for ACP MCP server configuration variants."""
+
+_MCP_SERVER_TYPES = (HttpMcpServer, SseMcpServer, McpServerStdio)
+"""Runtime MCP server classes used to detect legacy positional `new_session` calls."""
+
+_ACP_MODE_METADATA_KEY = "acp_mode"
+_ACP_MODEL_METADATA_KEY = "acp_model"
+_ACP_SESSION_METADATA_KEY = "acp_session"
+
+
+def _normalize_new_session_args(
+    additional_directories: list[str] | list[McpServer] | None,
+    mcp_servers: list[McpServer] | None,
+) -> tuple[list[str] | None, list[McpServer]]:
+    """Normalize `new_session` arguments while preserving old positional calls."""
+    if mcp_servers is not None:
+        return (
+            additional_directories if _is_additional_directories(additional_directories) else None,
+            mcp_servers,
+        )
+    if additional_directories is None:
+        return None, []
+    if _is_additional_directories(additional_directories):
+        return additional_directories, []
+    if _is_mcp_servers(additional_directories):
+        return None, additional_directories
+    return None, []
+
+
+def _is_additional_directories(
+    additional_directories: list[str] | list[McpServer] | None,
+) -> TypeGuard[list[str]]:
+    """Return whether a value is the ACP `additional_directories` argument."""
+    return additional_directories is not None and all(
+        isinstance(directory, str) for directory in additional_directories
+    )
+
+
+def _is_mcp_servers(
+    mcp_servers: list[str] | list[McpServer],
+) -> TypeGuard[list[McpServer]]:
+    """Return whether a value is the ACP `mcp_servers` argument."""
+    return all(isinstance(server, _MCP_SERVER_TYPES) for server in mcp_servers)
+
+
+def _replay_content_blocks(
+    message: Any,
+) -> list[TextContentBlock | ImageContentBlock | AudioContentBlock]:
+    """Convert persisted LangChain content into replayable ACP blocks."""
+    replay_blocks: list[TextContentBlock | ImageContentBlock | AudioContentBlock] = []
+    for block in message.content_blocks:
+        block_type = block.get("type")
+        data = block.get("base64")
+        mime_type = block.get("mime_type")
+        if block_type == "text":
+            replay_blocks.append(text_block(block["text"]))
+        elif not (isinstance(data, str) and isinstance(mime_type, str)):
+            continue
+        elif block_type == "image":
+            replay_blocks.append(image_block(data, mime_type, uri=block.get("url")))
+        elif block_type == "audio":
+            replay_blocks.append(audio_block(data, mime_type))
+    return replay_blocks
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +172,7 @@ class AgentServerACP(ACPAgent):
         *,
         modes: SessionModeState | None = None,
         models: list[dict[str, str]] | None = None,
+        load_sessions: bool = False,
     ) -> None:
         """Initialize the ACP agent server with the given agent factory or compiled graph.
 
@@ -102,11 +181,15 @@ class AgentServerACP(ACPAgent):
             modes: Optional mode configuration (deprecated, use config_options instead)
             models: Optional list of available models with 'value', 'name', and optionally
               'description'
+            load_sessions: Advertise and implement durable `session/load`. The agent graph
+              must use a checkpointer that survives server restarts.
         """
         super().__init__()
         self._cwd = ""
         self._agent_factory = agent
         self._agent: CompiledStateGraph | None = None
+        self._agent_session_id: str | None = None
+        self._load_sessions = load_sessions
 
         if isinstance(agent, CompiledStateGraph):
             if modes is not None:
@@ -127,6 +210,7 @@ class AgentServerACP(ACPAgent):
         self._cancelled = False
         self._session_plans: dict[str, list[dict[str, Any]]] = {}
         self._session_cwds: dict[str, str] = {}
+        self._session_mcp_servers: dict[str, list[McpServer]] = {}
         self._allowed_command_types: dict[
             str, set[tuple[str, str | None]]
         ] = {}  # Track allowed command types per session
@@ -135,14 +219,17 @@ class AgentServerACP(ACPAgent):
         """Store the client connection for sending session updates."""
         self._conn = conn
 
-    def _build_config_options(self, session_id: str) -> list[SessionConfigOption]:
+    def _build_config_options(
+        self,
+        session_id: str,
+    ) -> list[SessionConfigOptionSelect | SessionConfigOptionBoolean]:
         """Build the list of session configuration options.
 
         Returns a list combining mode and model selectors if available.
         Modes are mapped to config options with category='mode'.
         Models are exposed as config options with category='model'.
         """
-        config_options: list[SessionConfigOption] = []
+        config_options: list[SessionConfigOptionSelect | SessionConfigOptionBoolean] = []
 
         # Add mode selector if modes are configured
         if self._modes is not None:
@@ -156,18 +243,18 @@ class AgentServerACP(ACPAgent):
                 for mode in self._modes.available_modes
             ]
 
-            mode_config = SessionConfigOption(
-                root=SessionConfigOptionSelect(
-                    id="mode",
-                    name="Session Mode",
-                    description="Controls how the agent requests permission",
-                    category="mode",
-                    type="select",
-                    current_value=current_mode,
-                    options=mode_options,
-                )
+            mode_select = SessionConfigOptionSelect(
+                id="mode",
+                name="Session Mode",
+                description="Controls how the agent requests permission",
+                category="mode",
+                type="select",
+                current_value=current_mode,
+                options=mode_options,
             )
-            config_options.append(mode_config)
+            config_options.append(
+                SessionConfigOption(root=mode_select) if SessionConfigOption else mode_select,
+            )
 
         # Add model selector if models are configured
         if self._models is not None and len(self._models) > 0:
@@ -181,18 +268,18 @@ class AgentServerACP(ACPAgent):
                 for model in self._models
             ]
 
-            model_config = SessionConfigOption(
-                root=SessionConfigOptionSelect(
-                    id="model",
-                    name="Model",
-                    description="The LLM model to use for this session",
-                    category="model",
-                    type="select",
-                    current_value=current_model,
-                    options=model_options,
-                )
+            model_select = SessionConfigOptionSelect(
+                id="model",
+                name="Model",
+                description="The LLM model to use for this session",
+                category="model",
+                type="select",
+                current_value=current_model,
+                options=model_options,
             )
-            config_options.append(model_config)
+            config_options.append(
+                SessionConfigOption(root=model_select) if SessionConfigOption else model_select,
+            )
 
         return config_options
 
@@ -207,31 +294,30 @@ class AgentServerACP(ACPAgent):
         return InitializeResponse(
             protocol_version=protocol_version,
             agent_capabilities=AgentCapabilities(
+                load_session=self._load_sessions,
                 prompt_capabilities=PromptCapabilities(
                     image=True,
-                )
+                ),
             ),
         )
 
     async def new_session(
         self,
         cwd: str,
-        mcp_servers: list[HttpMcpServer | SseMcpServer | McpServerStdio] | None = None,
+        additional_directories: list[str] | list[McpServer] | None = None,
+        mcp_servers: list[McpServer] | None = None,
         **kwargs: Any,  # noqa: ARG002  # ACP protocol interface parameter
     ) -> NewSessionResponse:
         """Create a new agent session with the given working directory."""
-        if mcp_servers is None:
-            mcp_servers = []
+        _, mcp_servers = _normalize_new_session_args(additional_directories, mcp_servers)
         session_id = uuid4().hex
         self._session_cwds[session_id] = cwd
+        self._session_mcp_servers[session_id] = mcp_servers
 
-        # Initialize session state
-        if self._modes is not None:
-            self._session_modes[session_id] = self._modes.current_mode_id
-            self._session_mode_states[session_id] = self._modes
+        self._initialize_session_options(session_id)
 
-        if self._models is not None and len(self._models) > 0:
-            self._session_models[session_id] = self._models[0]["value"]
+        if self._load_sessions:
+            await self._persist_session(session_id)
 
         # Build config options if we have modes or models
         config_options = None
@@ -243,6 +329,42 @@ class AgentServerACP(ACPAgent):
             session_id=session_id,
             modes=self._modes if self._modes is not None else None,
             config_options=config_options,
+        )
+
+    async def load_session(
+        self,
+        cwd: str,
+        session_id: str,
+        additional_directories: list[str] | None = None,  # noqa: ARG002  # capability is not advertised
+        mcp_servers: list[McpServer] | None = None,
+        **kwargs: Any,  # noqa: ARG002  # ACP protocol interface parameter
+    ) -> LoadSessionResponse:
+        """Restore and replay a persisted ACP session."""
+        if not self._load_sessions:
+            method = "session/load"
+            raise RequestError.method_not_found(method)
+
+        self._session_cwds[session_id] = cwd
+        agent = self._checkpointed_agent(session_id)
+        metadata = (await agent.aget_state(self._session_config(session_id))).metadata or {}
+        if metadata.get(_ACP_SESSION_METADATA_KEY) is not True:
+            self._forget_session(session_id)
+            raise RequestError.resource_not_found(session_id)
+        if metadata.get("cwd") != cwd:
+            self._forget_session(session_id)
+            raise RequestError.invalid_params(
+                {"cwd": "must match the working directory used to create the session"}
+            )
+
+        self._session_mcp_servers[session_id] = list(mcp_servers or [])
+        self._initialize_session_options(session_id)
+        if self._restore_session_options(session_id, metadata):
+            self._reset_agent(session_id)
+
+        await self._replay_session(session_id, agent)
+        return LoadSessionResponse(
+            modes=self._session_mode_states.get(session_id),
+            config_options=self._build_config_options(session_id) or None,
         )
 
     async def set_session_mode(
@@ -260,13 +382,15 @@ class AgentServerACP(ACPAgent):
                 current_mode_id=mode_id,
             )
             self._reset_agent(session_id)
+            if self._load_sessions:
+                await self._persist_session(session_id)
         return SetSessionModeResponse()
 
     async def set_config_option(
         self,
         config_id: str,
         session_id: str,
-        value: str,
+        value: str | bool,  # noqa: FBT001  # signature fixed by ACP protocol interface
         **kwargs: Any,  # noqa: ARG002  # ACP protocol interface parameter
     ) -> SetSessionConfigOptionResponse:
         """Update a configuration option for the session.
@@ -274,6 +398,11 @@ class AgentServerACP(ACPAgent):
         Handles both mode and model switching. When switching models,
         the agent is reset to use the new model.
         """
+        # Only select-type options (mode, model) are supported; reject boolean values.
+        if not isinstance(value, str):
+            msg = f"Config option {config_id!r} expects a string value, got {type(value).__name__}"
+            raise RequestError(-32602, msg)
+
         if config_id == "mode":
             # Handle mode switching
             if self._modes is not None and session_id in self._session_mode_states:
@@ -290,6 +419,8 @@ class AgentServerACP(ACPAgent):
                     current_mode_id=value,
                 )
                 self._reset_agent(session_id)
+                if self._load_sessions:
+                    await self._persist_session(session_id)
 
         elif config_id == "model":
             # Handle model switching
@@ -304,6 +435,8 @@ class AgentServerACP(ACPAgent):
                 self._session_models[session_id] = value
                 # Reset the agent to use the new model
                 self._reset_agent(session_id)
+                if self._load_sessions:
+                    await self._persist_session(session_id)
         else:
             msg = f"Unknown config option: {config_id}"
             raise RequestError(-32602, msg)
@@ -557,6 +690,185 @@ class AgentServerACP(ACPAgent):
             raw_input=tool_args,
         )
 
+    def _initialize_session_options(self, session_id: str) -> None:
+        """Initialize mode and model state for a new or loaded session."""
+        if self._modes is not None:
+            self._session_modes[session_id] = self._modes.current_mode_id
+            self._session_mode_states[session_id] = self._modes
+        if self._models:
+            self._session_models[session_id] = self._models[0]["value"]
+
+    def _restore_session_options(self, session_id: str, metadata: Mapping[str, Any]) -> bool:
+        """Restore persisted mode and model selections.
+
+        Returns:
+            Whether restoring the selections requires rebuilding a factory agent.
+        """
+        changed = False
+        saved_mode = metadata.get(_ACP_MODE_METADATA_KEY)
+        if (
+            self._modes is not None
+            and isinstance(saved_mode, str)
+            and any(mode.id == saved_mode for mode in self._modes.available_modes)
+        ):
+            state = self._session_mode_states[session_id]
+            self._session_modes[session_id] = saved_mode
+            self._session_mode_states[session_id] = SessionModeState(
+                available_modes=state.available_modes,
+                current_mode_id=saved_mode,
+            )
+            changed = saved_mode != self._modes.current_mode_id
+
+        saved_model = metadata.get(_ACP_MODEL_METADATA_KEY)
+        if (
+            self._models
+            and isinstance(saved_model, str)
+            and any(model["value"] == saved_model for model in self._models)
+        ):
+            self._session_models[session_id] = saved_model
+            changed = changed or saved_model != self._models[0]["value"]
+        return changed
+
+    def _session_config(self, session_id: str) -> RunnableConfig:
+        """Build the LangGraph config and durable metadata for an ACP session."""
+        metadata = {
+            _ACP_SESSION_METADATA_KEY: True,
+            "cwd": self._session_cwds[session_id],
+        }
+        if session_id in self._session_modes:
+            metadata[_ACP_MODE_METADATA_KEY] = self._session_modes[session_id]
+        if session_id in self._session_models:
+            metadata[_ACP_MODEL_METADATA_KEY] = self._session_models[session_id]
+        return {"configurable": {"thread_id": session_id}, "metadata": metadata}
+
+    def _checkpointed_agent(self, session_id: str) -> CompiledStateGraph:
+        """Return the session agent, requiring a configured checkpointer."""
+        if self._agent is None or self._agent_session_id != session_id:
+            self._reset_agent(session_id)
+        if self._agent is None or getattr(self._agent, "checkpointer", None) is None:
+            msg = "session/load requires an agent compiled with a checkpointer"
+            raise RuntimeError(msg)
+        return self._agent
+
+    async def _persist_session(self, session_id: str) -> None:
+        """Write the current ACP session metadata to its checkpoint thread."""
+        agent = self._checkpointed_agent(session_id)
+        await agent.aupdate_state(self._session_config(session_id), {}, as_node="__start__")
+
+    async def _replay_session(
+        self,
+        session_id: str,
+        agent: CompiledStateGraph,
+    ) -> None:
+        """Replay persisted conversation entries before `session/load` returns."""
+        snapshots = [
+            snapshot
+            async for snapshot in agent.aget_state_history(self._session_config(session_id))
+        ]
+        messages: dict[str, Any] = {}
+        for snapshot in reversed(snapshots):
+            for message in snapshot.values.get("messages", []):
+                messages[message.id] = message
+
+        active_tool_calls: dict[str, dict[str, Any]] = {}
+        for message in messages.values():
+            if message.type == "human":
+                await self._replay_human_message(session_id, message.id, message)
+            elif message.type == "ai":
+                await self._replay_ai_message(session_id, message.id, message, active_tool_calls)
+            elif message.type == "tool":
+                await self._replay_tool_message(session_id, message, active_tool_calls)
+
+    async def _replay_human_message(
+        self,
+        session_id: str,
+        message_id: str,
+        message: Any,
+    ) -> None:
+        """Replay one persisted user message."""
+        for block in _replay_content_blocks(message):
+            await self._conn.session_update(
+                session_id=session_id,
+                update=UserMessageChunk(
+                    session_update="user_message_chunk",
+                    content=block,
+                    message_id=message_id,
+                ),
+                source="DeepAgent",
+            )
+
+    async def _replay_ai_message(
+        self,
+        session_id: str,
+        message_id: str,
+        message: Any,
+        active_tool_calls: dict[str, dict[str, Any]],
+    ) -> None:
+        """Replay one persisted assistant message and its tool calls."""
+        for block in _replay_content_blocks(message):
+            await self._conn.session_update(
+                session_id=session_id,
+                update=AgentMessageChunk(
+                    session_update="agent_message_chunk",
+                    content=block,
+                    message_id=message_id,
+                ),
+                source="DeepAgent",
+            )
+        for tool_call in message.tool_calls:
+            tool_id = tool_call.get("id")
+            if tool_id is None:
+                continue
+            tool_name = tool_call["name"]
+            tool_args = tool_call["args"]
+            active_tool_calls[tool_id] = {"name": tool_name, "args": tool_args}
+            await self._conn.session_update(
+                session_id=session_id,
+                update=self._create_tool_call_start(tool_id, tool_name, tool_args),
+                source="DeepAgent",
+            )
+            if tool_name == "write_todos":
+                await self._handle_todo_update(
+                    session_id,
+                    tool_args.get("todos", []),
+                    log_plan=False,
+                )
+
+    async def _replay_tool_message(
+        self,
+        session_id: str,
+        message: Any,
+        active_tool_calls: dict[str, dict[str, Any]],
+    ) -> None:
+        """Replay one persisted tool result."""
+        tool_info = active_tool_calls.get(message.tool_call_id)
+        if tool_info is None or tool_info["name"] == "edit_file":
+            return
+        content = "".join(
+            block["text"] for block in message.content_blocks if block.get("type") == "text"
+        )
+        if tool_info["name"] == "execute":
+            content = format_execute_result(
+                command=str(tool_info["args"].get("command", "")),
+                result=content,
+            )
+        await self._conn.session_update(
+            session_id=session_id,
+            update=update_tool_call(
+                tool_call_id=message.tool_call_id,
+                status="failed" if message.status == "error" else "completed",
+                content=[tool_content(text_block(content))],
+            ),
+            source="DeepAgent",
+        )
+
+    def _forget_session(self, session_id: str) -> None:
+        """Discard state created while validating a session."""
+        self._session_cwds.pop(session_id, None)
+        if self._agent_session_id == session_id:
+            self._agent = None
+            self._agent_session_id = None
+
     def _reset_agent(self, session_id: str) -> None:
         """Reset the agent instance, re-creating it from the factory if applicable."""
         cwd = self._session_cwds.get(session_id)
@@ -572,6 +884,7 @@ class AgentServerACP(ACPAgent):
             model = self._session_models.get(session_id) if self._models is not None else None
             context = AgentSessionContext(cwd=self._cwd, mode=mode, model=model)
             self._agent = self._agent_factory(context)
+        self._agent_session_id = session_id
 
     async def prompt(  # noqa: C901, PLR0912, PLR0915  # Complex streaming protocol handler with many branches
         self,
@@ -583,20 +896,21 @@ class AgentServerACP(ACPAgent):
             | EmbeddedResourceContentBlock
         ],
         session_id: str,
+        message_id: str | None = None,  # noqa: ARG002  # ACP protocol interface parameter
         **kwargs: Any,  # noqa: ARG002  # ACP protocol interface parameter
     ) -> PromptResponse:
         """Process a user prompt and stream the agent response."""
-        if self._agent is None:
+        if self._agent is None or (
+            self._agent_session_id is not None and self._agent_session_id != session_id
+        ):
             self._reset_agent(session_id)
-
-            if getattr(self._agent, "checkpointer", None) is None:
-                self._agent.checkpointer = (
-                    MemorySaver()
-                )  # ty: ignore[unresolved-attribute]  # Guarded by getattr check above
 
         if self._agent is None:
             msg = "Agent initialization failed"
             raise RuntimeError(msg)
+
+        if getattr(self._agent, "checkpointer", None) is None:
+            self._agent.checkpointer = MemorySaver()  # Guarded by getattr check above
         agent = self._agent
 
         # Reset cancellation flag for new prompt
@@ -619,7 +933,7 @@ class AgentServerACP(ACPAgent):
             elif isinstance(block, EmbeddedResourceContentBlock):
                 content_blocks.extend(convert_embedded_resource_block_to_content_blocks(block))
         # Stream the deep agent response with multimodal content
-        config: RunnableConfig = {"configurable": {"thread_id": session_id}}
+        config = self._session_config(session_id)
 
         # Track active tool calls and accumulate chunks by index
         active_tool_calls = {}
@@ -634,6 +948,7 @@ class AgentServerACP(ACPAgent):
                 self._cancelled = False  # Reset for next prompt
                 return PromptResponse(stop_reason="cancelled")
 
+            pending_interrupts: Sequence[Interrupt] = ()
             async for stream_chunk in agent.astream(
                 Command(resume={"decisions": user_decisions})
                 if user_decisions
@@ -678,12 +993,12 @@ class AgentServerACP(ACPAgent):
                                         {"interrupt_value": interrupt_value},
                                     )
 
-                            current_state = await agent.aget_state(config)
-                            user_decisions = await self._handle_interrupts(
-                                current_state=current_state,
-                                session_id=session_id,
-                            )
-                            break
+                            # The checkpoint backing this update may not be visible until
+                            # the stream iterator has closed. Defer reading state until
+                            # after leaving the async iterator so persistent checkpointers
+                            # do not return a stale, pre-interrupt snapshot.
+                            pending_interrupts = interrupt_objs
+                            continue
 
                     for node_name, update in updates.items():
                         if node_name == "tools" and isinstance(update, dict) and "todos" in update:
@@ -760,8 +1075,16 @@ class AgentServerACP(ACPAgent):
             # The loop continues while there are interrupts (line 467)
             # We get the current state to check the loop condition
             current_state = await agent.aget_state(config)
-            # Note: Interrupts are handled during streaming via __interrupt__ updates
-            # This state check is only for the while loop condition
+            if pending_interrupts:
+                user_decisions = await self._handle_interrupts(
+                    current_state=current_state,
+                    session_id=session_id,
+                    pending_interrupts=pending_interrupts,
+                )
+                if user_decisions:
+                    # A stale snapshot has no interrupts and would otherwise end
+                    # the loop before the selected decisions can resume the graph.
+                    current_state = None
 
         return PromptResponse(stop_reason="end_turn")
 
@@ -770,12 +1093,14 @@ class AgentServerACP(ACPAgent):
         *,
         current_state: StateSnapshot,
         session_id: str,
+        pending_interrupts: Sequence[Interrupt] | None = None,
     ) -> list[dict[str, Any]]:
         """Handle agent interrupts by requesting permission from the client."""
         user_decisions: list[dict[str, Any]] = []
-        if current_state.next and current_state.interrupts:
+        interrupts = pending_interrupts or current_state.interrupts
+        if (pending_interrupts or current_state.next) and interrupts:
             # Agent is interrupted, request permission from user
-            for interrupt in current_state.interrupts:
+            for interrupt in interrupts:
                 # Get the tool call info from the interrupt
                 tool_call_id = interrupt.id
                 interrupt_value = interrupt.value
@@ -951,7 +1276,7 @@ class AgentServerACP(ACPAgent):
 
 async def _serve_test_agent() -> None:
     """Run test agent from the root of the repository with ACP integration."""
-    from dotenv import load_dotenv  # Lazy import for dev-only entry point
+    from dotenv import load_dotenv  # noqa: PLC0415  # lazy import for dev-only entry point
 
     load_dotenv()
 
